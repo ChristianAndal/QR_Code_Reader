@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0ea5e9" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>QR Scanner (Mobile)</title>
+  <script src="https://unpkg.com/jsqr@1.4.0/dist/jsQR.js"></script>
+  <style>
+    :root { --pad: max(12px, env(safe-area-inset-left)); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    body { margin:0; background:#0b1220; color:#f8fafc; }
+    .wrap { min-height:100svh; padding: env(safe-area-inset-top) var(--pad) env(safe-area-inset-bottom) var(--pad); display:flex; flex-direction:column; gap:12px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    h1 { font-size:1.1rem; margin:0; font-weight:600; }
+    .hint { opacity:.8; font-size:.9rem; }
+    .viewer { position:relative; background:#000; border-radius:18px; overflow:hidden; }
+    .viewer::after { content:""; display:block; padding-top: 133%; } /* 3:4 on tall phones */
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; display:block; }
+    .overlay { position:absolute; inset:0; pointer-events:none; }
+    .qr-box { position:absolute; border:3px solid rgba(34,197,94,.85); border-radius:10px; display:none; }
+    .controls { display:flex; gap:8px; flex-wrap:wrap; }
+    button, .btn { appearance:none; border:0; border-radius:14px; padding:12px 14px; font-size:1rem; line-height:1; background:#111827; color:#f8fafc; flex:1; touch-action:manipulation; }
+    .primary { background:#0ea5e9; color:#001018; font-weight:600; }
+    .ghost { background:#0b1220; border:1px solid #1f2937; }
+    .row { display:flex; gap:8px; }
+    input[type=file] { display:none; }
+    .status, .result { border-radius:14px; padding:12px; background:#0f172a; border:1px solid #1f2937; word-break:break-word; }
+    .result { background:#052e1a; border-color:#065f46; }
+    .copy { margin-left:auto; }
+    .small { font-size:.85rem; opacity:.85; }
+    .tap { text-decoration: underline dotted; cursor:pointer; }
+    .footer { text-align:center; opacity:.65; font-size:.85rem; padding-bottom:4px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>QR Scanner</h1>
+    <div class="hint">Point at a QR, or <span id="uploadTap" class="tap">upload</span></div>
+  </header>
+
+  <div class="viewer" id="viewer">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+    <div class="overlay">
+      <div id="qrBox" class="qr-box"></div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="startBtn" class="primary">Start camera</button>
+    <button id="stopBtn" class="ghost">Stop</button>
+    <button id="torchBtn" class="ghost">Torch</button>
+  </div>
+
+  <div class="row">
+    <label class="btn ghost" for="fileInput" style="flex:1">
+      Upload / Take photo
+      <input id="fileInput" type="file" accept="image/*" capture="environment" />
+    </label>
+    <button id="swapBtn" class="btn ghost" style="flex:0 0 auto;">Switch cam</button>
+  </div>
+
+  <div class="status small">Status: <span id="status">idle</span></div>
+
+  <div class="result" id="result" aria-live="polite">
+    No QR data yet.
+  </div>
+  <div class="row">
+    <button id="copyBtn" class="btn copy">Copy</button>
+    <a id="openBtn" href="#" class="btn" target="_blank" rel="noopener">Open as link</a>
+  </div>
+
+  <div class="footer small">Use over HTTPS. On iOS/Android allow camera permission.</div>
+</div>
+
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const statusEl = document.getElementById('status');
+  const resultEl = document.getElementById('result');
+  const qrBox = document.getElementById('qrBox');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const torchBtn = document.getElementById('torchBtn');
+  const fileInput = document.getElementById('fileInput');
+  const swapBtn = document.getElementById('swapBtn');
+  const uploadTap = document.getElementById('uploadTap');
+  const copyBtn = document.getElementById('copyBtn');
+  const openBtn = document.getElementById('openBtn');
+
+  let stream = null, track = null, scanning = false, rafId = null;
+  let torchOn = false;
+  let usingDeviceId = null;
+
+  function setStatus(t){ statusEl.textContent = t; }
+  function setResult(text){
+    resultEl.textContent = text || 'No QR data yet.';
+    openBtn.href = '#';
+    if (text && /^https?:\/\//i.test(text.trim())) {
+      openBtn.href = text.trim();
+    }
+  }
+
+  async function enumerateCams(){
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return devices.filter(d => d.kind === 'videoinput');
+    } catch { return []; }
+  }
+
+  async function startCamera(opts = {}){
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatus('Camera API not supported.');
+      return;
+    }
+    stopCamera(); // clean up any previous
+    const idealFacing = opts.facingMode || 'environment';
+    const constraints = {
+      video: {
+        facingMode: usingDeviceId ? undefined : { ideal: idealFacing },
+        deviceId: usingDeviceId ? { exact: usingDeviceId } : undefined,
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        focusMode: "continuous", // some browsers ignore
+        advanced: [{ focusMode: "continuous" }]
+      },
+      audio: false
+    };
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      track = stream.getVideoTracks()[0];
+      scanning = true;
+      await video.play();
+      setStatus('Camera started.');
+      tick();
+    } catch (e) {
+      console.error(e);
+      setStatus((e && e.message) ? e.message : 'Could not start camera.');
+    }
+  }
+
+  function stopCamera(){
+    scanning = false;
+    if (rafId) cancelAnimationFrame(rafId), rafId = null;
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    video.srcObject = null;
+    track = null;
+    qrBox.style.display = 'none';
+    torchOn = false;
+  }
+
+  function drawBox(loc){
+    if (!loc) { qrBox.style.display = 'none'; return; }
+    const xs = [loc.topLeftCorner.x, loc.topRightCorner.x, loc.bottomRightCorner.x, loc.bottomLeftCorner.x];
+    const ys = [loc.topLeftCorner.y, loc.topRightCorner.y, loc.bottomRightCorner.y, loc.bottomLeftCorner.y];
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+
+    // map canvas pixels to displayed video box
+    const scaleX = video.clientWidth / canvas.width;
+    const scaleY = video.clientHeight / canvas.height;
+
+    qrBox.style.display = 'block';
+    qrBox.style.left = (minX * scaleX) + 'px';
+    qrBox.style.top = (minY * scaleY) + 'px';
+    qrBox.style.width = Math.max(2, (maxX - minX) * scaleX) + 'px';
+    qrBox.style.height = Math.max(2, (maxY - minY) * scaleY) + 'px';
+  }
+
+  function tick(){
+    if (!scanning) return;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    // keep canvas matched to actual video frame size
+    if (video.videoWidth && video.videoHeight) {
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+      }
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(img.data, img.width, img.height, { inversionAttempts: "attemptBoth" });
+      if (code) {
+        setStatus('QR detected.');
+        setResult(code.data);
+        drawBox(code.location);
+        // Uncomment to auto-stop after first scan:
+        // scanning = false; stopCamera();
+        // navigator.vibrate?.(60); // tiny haptic on supported phones
+      } else {
+        setStatus('Scanning…');
+        drawBox(null);
+      }
+    } else {
+      setStatus('Starting video…');
+    }
+    rafId = requestAnimationFrame(tick);
+  }
+
+  async function toggleTorch(){
+    if (!track) { setStatus('Start the camera first.'); return; }
+    try {
+      // Most reliable approach on Android Chrome
+      await track.applyConstraints({ advanced: [{ torch: !torchOn }] });
+      torchOn = !torchOn;
+      setStatus('Torch ' + (torchOn ? 'on' : 'off') + '.');
+    } catch (e) {
+      setStatus('Torch not supported on this device.');
+    }
+  }
+
+  // File upload fallback (also opens camera on many phones)
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    stopCamera();
+    setStatus('Decoding image…');
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(data.data, data.width, data.height, { inversionAttempts: "attemptBoth" });
+      if (code) {
+        setResult(code.data);
+        setStatus('Found QR in image.');
+      } else {
+        setResult('No QR found in image.');
+        setStatus('No QR detected.');
+      }
+      URL.revokeObjectURL(img.src);
+    };
+    img.onerror = () => setStatus('Failed to load image.');
+    img.src = URL.createObjectURL(file);
+    fileInput.value = '';
+  });
+
+  // Controls
+  startBtn.addEventListener('click', () => startCamera({ facingMode: 'environment' }));
+  stopBtn.addEventListener('click', stopCamera);
+  torchBtn.addEventListener('click', toggleTorch);
+  uploadTap.addEventListener('click', () => fileInput.click());
+
+  swapBtn.addEventListener('click', async () => {
+    const cams = await enumerateCams();
+    if (!cams.length) { setStatus('No other cameras found.'); return; }
+    // rotate through cameras
+    const idx = cams.findIndex(c => c.deviceId === usingDeviceId);
+    const next = cams[(idx + 1) % cams.length];
+    usingDeviceId = next.deviceId;
+    await startCamera();
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    const text = resultEl.textContent.trim();
+    if (!text || text === 'No QR data yet.') return;
+    try { await navigator.clipboard.writeText(text); setStatus('Copied to clipboard.'); }
+    catch { setStatus('Could not copy.'); }
+  });
+
+  // Start immediately on load for convenience (mobile will still prompt permission)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') stopCamera();
+  });
+  setResult('');
+  setStatus('idle');
+})();
+</script>
+</body>
+</html>
